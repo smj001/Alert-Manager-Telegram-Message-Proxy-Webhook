@@ -7,7 +7,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /telegram-webhook
+RUN CGO_ENABLED=0 GOOS=linux go build -o /telegram-webhook ./cmd/server/main.go
 
 FROM alpine:3.18
 
