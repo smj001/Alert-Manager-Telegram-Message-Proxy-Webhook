@@ -15,8 +15,7 @@ type WebhookHandler struct {
 	apiKey          string
 }
 
-func NewWebhookHandler(telegramService *services.TelegramService, apiKey string) *WebhookHandler {
-	queueService := services.NewQueueService(telegramService)
+func NewWebhookHandler(telegramService *services.TelegramService, queueService *services.QueueService, apiKey string) *WebhookHandler {
 	return &WebhookHandler{
 		telegramService: telegramService,
 		queueService:    queueService,

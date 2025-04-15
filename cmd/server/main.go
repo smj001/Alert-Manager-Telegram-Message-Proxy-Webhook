@@ -19,12 +19,17 @@ func main() {
 		log.Fatalf("Failed to initialize Telegram service: %v", err)
 	}
 
-	// Initialize webhook handler
-	webhookHandler := handlers.NewWebhookHandler(telegramService, cfg.APIKey)
+	// Initialize queue service
+	queueService := services.NewQueueService(telegramService)
+
+	// Initialize handlers
+	webhookHandler := handlers.NewWebhookHandler(telegramService, queueService, cfg.APIKey)
+	alertManagerHandler := handlers.NewAlertManagerHandler(telegramService, queueService, cfg.APIKey)
 
 	// Set up HTTP routes
 	http.HandleFunc("/health", webhookHandler.HandleHealth)
 	http.HandleFunc("/webhook", webhookHandler.HandleWebhook)
+	http.HandleFunc("/alertmanager", alertManagerHandler.HandleAlertManager)
 
 	// Start server
 	log.Printf("Server starting on port %s", cfg.ServerPort)
