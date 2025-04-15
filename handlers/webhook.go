@@ -11,12 +11,15 @@ import (
 
 type WebhookHandler struct {
 	telegramService *services.TelegramService
+	queueService    *services.QueueService
 	apiKey          string
 }
 
 func NewWebhookHandler(telegramService *services.TelegramService, apiKey string) *WebhookHandler {
+	queueService := services.NewQueueService(telegramService)
 	return &WebhookHandler{
 		telegramService: telegramService,
+		queueService:    queueService,
 		apiKey:          apiKey,
 	}
 }
@@ -43,13 +46,13 @@ func (h *WebhookHandler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.telegramService.SendMessage(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if err := h.queueService.EnqueueMessage(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to queue message: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(models.WebhookResponse{Status: "success"})
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(models.WebhookResponse{Status: "queued"})
 }
 
 func (h *WebhookHandler) HandleHealth(w http.ResponseWriter, r *http.Request) {
