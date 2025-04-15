@@ -1,4 +1,4 @@
-FROM golang:1.21-alpine AS builder
+FROM golang:1.21.3-alpine3.18 AS builder
 
 WORKDIR /app
 
@@ -9,7 +9,10 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o /telegram-webhook
 
-FROM alpine:latest
+FROM alpine:3.18
+
+LABEL Name="telegram-webhook" \
+    Version="1.0.0"
 
 WORKDIR /app
 
