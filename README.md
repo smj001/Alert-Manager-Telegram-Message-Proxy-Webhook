@@ -65,6 +65,32 @@ docker run -d \
   telegram-webhook
 ```
 
+## Docker Compose
+
+The project includes a `docker-compose.yml` file for easy deployment:
+
+1. Build and start the container:
+   ```bash
+   docker-compose up -d
+   ```
+
+2. View logs:
+   ```bash
+   docker-compose logs -f
+   ```
+
+3. Stop the container:
+   ```bash
+   docker-compose down
+   ```
+
+The docker-compose configuration includes:
+- Automatic container restart
+- Health checks
+- Environment variable support
+- Network isolation
+- Port mapping
+
 ## API Usage
 
 Send a POST request to `/webhook` with the following JSON body:

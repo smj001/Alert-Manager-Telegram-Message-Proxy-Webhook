@@ -23,6 +23,7 @@ func main() {
 	webhookHandler := handlers.NewWebhookHandler(telegramService, cfg.APIKey)
 
 	// Set up HTTP routes
+	http.HandleFunc("/health", webhookHandler.HandleHealth)
 	http.HandleFunc("/webhook", webhookHandler.HandleWebhook)
 
 	// Start server
