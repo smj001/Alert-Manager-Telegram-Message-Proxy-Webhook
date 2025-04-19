@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
+	"strconv"
 
 	"github.com/smj/Alert-Manager-Telegram-Message-Proxy-Webhook/models"
 	"github.com/smj/Alert-Manager-Telegram-Message-Proxy-Webhook/services"
@@ -29,24 +29,7 @@ func (h *AlertManagerHandler) authenticateRequest(r *http.Request) bool {
 	return authHeader == fmt.Sprintf("Bearer %s", h.apiKey)
 }
 
-func (h *AlertManagerHandler) formatAlertMessage(alert models.AlertManagerAlert) string {
-	var sb strings.Builder
-
-	sb.WriteString("\n\nAlerts Firing:\n")
-	sb.WriteString("Labels:\n")
-	for k, v := range alert.Labels {
-		sb.WriteString(fmt.Sprintf(" - %s = %s\n", k, v))
-	}
-
-	sb.WriteString("Annotations:\n")
-	for k, v := range alert.Annotations {
-		sb.WriteString(fmt.Sprintf(" - %s = %s\n", k, v))
-	}
-
-	return sb.String()
-}
-
-func (h *AlertManagerHandler) HandleAlertManager(w http.ResponseWriter, r *http.Request) {
+func (h *AlertManagerHandler) HandleAlertManagerWebhook(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticateRequest(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
@@ -57,21 +40,38 @@ func (h *AlertManagerHandler) HandleAlertManager(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var req models.AlertManagerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	var alertManagerWebhook models.AlertManagerWebhook
+	if err := json.NewDecoder(r.Body).Decode(&alertManagerWebhook); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
+	// Get chat_id from common labels
+	chatIDStr, ok := alertManagerWebhook.CommonLabels["chat_id"]
+	if !ok {
+		http.Error(w, "chat_id not found in common labels", http.StatusBadRequest)
+		return
+	}
+
+	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid chat_id format", http.StatusBadRequest)
+		return
+	}
+
 	// Process each alert
-	for _, alert := range req.Alerts {
-		message := h.formatAlertMessage(alert)
-		webhookReq := &models.WebhookRequest{
-			ChatID:  -1002675286276, // Your default chat ID
+	for _, alert := range alertManagerWebhook.Alerts {
+		// Format the message
+		message := formatAlertMessage(alert, alertManagerWebhook.CommonLabels)
+
+		// Create webhook request
+		req := &models.WebhookRequest{
+			ChatID:  chatID,
 			Message: message,
 		}
 
-		if err := h.queueService.EnqueueMessage(webhookReq); err != nil {
+		// Queue the message
+		if err := h.queueService.EnqueueMessage(req); err != nil {
 			http.Error(w, fmt.Sprintf("Failed to queue message: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -79,4 +79,36 @@ func (h *AlertManagerHandler) HandleAlertManager(w http.ResponseWriter, r *http.
 
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(models.WebhookResponse{Status: "queued"})
+}
+
+func formatAlertMessage(alert models.AlertManagerAlert, commonLabels map[string]string) string {
+	status := "🔴 FIRING"
+	if alert.Status == "resolved" {
+		status = "✅ RESOLVED"
+	}
+
+	message := fmt.Sprintf("%s\n", status)
+	message += fmt.Sprintf("Alert: %s\n", alert.Labels["alertname"])
+
+	if severity, ok := alert.Labels["severity"]; ok {
+		message += fmt.Sprintf("Severity: %s\n", severity)
+	}
+
+	if instance, ok := alert.Labels["instance"]; ok {
+		message += fmt.Sprintf("Instance: %s\n", instance)
+	}
+
+	if description, ok := alert.Annotations["description"]; ok {
+		message += fmt.Sprintf("Description: %s\n", description)
+	}
+
+	if summary, ok := alert.Annotations["summary"]; ok {
+		message += fmt.Sprintf("Summary: %s\n", summary)
+	}
+
+	if alert.GeneratorURL != "" {
+		message += fmt.Sprintf("Source: %s\n", alert.GeneratorURL)
+	}
+
+	return message
 }
