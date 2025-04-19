@@ -127,12 +127,6 @@ route:
   group_interval: 1s
   repeat_interval: 1m
   receiver: 'telegram'
-  routes:
-    - receiver: 'telegram'
-      group_by: ['alertname']
-      continue: true
-      labels:
-        chat_id: "-1001234567890"  # Your Telegram chat ID
 
 receivers:
 - name: 'telegram'
@@ -144,6 +138,30 @@ receivers:
         type: Bearer
         credentials: 'your_api_key'
 ```
+
+#### Adding Telegram Chat ID to Prometheus Alerts
+
+You can add the `chat_id` label to your Prometheus alert rules. Here's an example:
+
+```yaml
+groups:
+- name: example
+  rules:
+  - alert: HighCPUUsage
+    expr: cpu_usage > 80
+    for: 5m
+    labels:
+      severity: warning
+      chat_id: "-12345678901011"  # Your Telegram chat ID
+    annotations:
+      summary: "High CPU usage detected"
+      description: "CPU usage is above 80% for 5 minutes"
+```
+
+The `chat_id` label can be added to:
+1. Individual alerts in your Prometheus rules
+2. Alert groups using the `labels` field
+3. Alert templates if you're using them
 
 #### Getting Telegram Chat ID
 1. Add your bot to a group/channel
