@@ -99,15 +99,15 @@ func formatAlertMessage(alert models.AlertManagerAlert, commonLabels map[string]
 	}
 
 	if description, ok := alert.Annotations["description"]; ok {
-		message += fmt.Sprintf("Description: %s\n", description)
+		message += fmt.Sprintf("Description: \n%s\n", description)
 	}
 
 	if summary, ok := alert.Annotations["summary"]; ok {
-		message += fmt.Sprintf("Summary: %s\n", summary)
+		message += fmt.Sprintf("Summary: \n%s\n", summary)
 	}
 
 	if alert.GeneratorURL != "" {
-		message += fmt.Sprintf("Source: %s\n", alert.GeneratorURL)
+		message += fmt.Sprintf("Source: \n%s\n", alert.GeneratorURL)
 	}
 
 	return message
