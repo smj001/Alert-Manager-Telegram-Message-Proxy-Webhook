@@ -1,14 +1,14 @@
 .PHONY: build run test clean
 
 build:
-	go build -o bin/server cmd/server/main.go
+	go build -trimpath -o bin/server ./cmd/server
 
 run:
-	go run cmd/server/main.go
+	go run ./cmd/server
 
 test:
 	go test -v ./...
 
 clean:
 	rm -rf bin/
-	go clean 
+	go clean

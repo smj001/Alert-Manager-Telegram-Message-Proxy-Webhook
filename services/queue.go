@@ -1,138 +1,244 @@
 package services
 
 import (
-	"fmt"
-	"log"
+	"container/list"
+	"context"
+	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/smj/Alert-Manager-Telegram-Message-Proxy-Webhook/models"
 )
 
-type QueueService struct {
-	messages    chan *models.QueuedMessage
-	telegram    *TelegramService
-	workerCount int
-	wg          sync.WaitGroup
-	rateLimiter chan struct{}
-	mu          sync.Mutex
-	stats       struct {
-		processed int
-		failed    int
-		queued    int
-	}
-}
-
 const (
-	WorkerCount     = 20          // Increased worker count
-	RateLimit       = 30          // Messages per minute
-	RateLimitWindow = time.Minute // Rate limit window
-	QueueSize       = 5000        // Increased queue size
+	workerCount  = 20
+	queueSize    = 5000
+	sendInterval = 2 * time.Second // 30 Telegram calls per minute, per process.
+	retryDelay   = 5 * time.Second
+	maxAttempts  = 3
 )
 
-func NewQueueService(telegram *TelegramService) *QueueService {
-	queue := &QueueService{
-		messages:    make(chan *models.QueuedMessage, QueueSize),
-		telegram:    telegram,
-		workerCount: WorkerCount,
-		rateLimiter: make(chan struct{}, RateLimit),
-	}
+var ErrQueueUnavailable = errors.New("message queue is full or closed")
 
-	// Initialize rate limiter
-	go func() {
-		ticker := time.NewTicker(RateLimitWindow / RateLimit)
-		for range ticker.C {
-			select {
-			case queue.rateLimiter <- struct{}{}:
-			default:
-			}
-		}
-	}()
-
-	// Start worker pool
-	for i := 0; i < queue.workerCount; i++ {
-		queue.wg.Add(1)
-		go queue.worker()
-	}
-
-	// Start stats logging
-	go queue.logStats()
-
-	return queue
+type QueueService struct {
+	mu            sync.Mutex // Protects admission, ready groups, pending count, and cooldown.
+	ready         *sync.Cond
+	groups        list.List // Each entry holds the remaining pages of one chat's digest.
+	closed        bool
+	cooldownUntil time.Time
+	capacity      int
+	pending       int64
+	ctx           context.Context
+	cancel        context.CancelFunc
+	done          chan struct{}
+	ticks         <-chan time.Time
+	delay         time.Duration
+	send          func(context.Context, models.WebhookRequest) error
 }
 
-func (q *QueueService) logStats() {
-	ticker := time.NewTicker(5 * time.Second)
-	for range ticker.C {
-		q.mu.Lock()
-		log.Printf("Queue Stats - Processed: %d, Failed: %d, Queued: %d",
-			q.stats.processed, q.stats.failed, q.stats.queued)
-		q.mu.Unlock()
+func NewQueueService(send func(context.Context, models.WebhookRequest) error) *QueueService {
+	return newQueue(send, workerCount, queueSize, sendInterval, retryDelay)
+}
+
+func newQueue(send func(context.Context, models.WebhookRequest) error, workers, capacity int, interval, delay time.Duration) *QueueService {
+	ctx, cancel := context.WithCancel(context.Background())
+	ticker := time.NewTicker(interval)
+	q := &QueueService{
+		capacity: capacity, ctx: ctx, cancel: cancel,
+		done: make(chan struct{}), ticks: ticker.C, delay: delay, send: send,
 	}
+	q.ready = sync.NewCond(&q.mu)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			q.worker()
+		}()
+	}
+	go func() {
+		wg.Wait()
+		ticker.Stop()
+		cancel()
+		close(q.done)
+	}()
+	return q
+}
+
+// Enqueue admits the whole batch or none. Each message counts toward capacity,
+// including pages waiting behind an in-flight message for the same chat.
+func (q *QueueService) Enqueue(batch []models.WebhookRequest) error {
+	if len(batch) > q.capacity {
+		return ErrQueueUnavailable
+	}
+	groups := groupMessagesByChat(batch)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed || q.pending+int64(len(batch)) > int64(q.capacity) {
+		return ErrQueueUnavailable
+	}
+	q.pending += int64(len(batch))
+	for _, group := range groups {
+		q.groups.PushBack(group)
+	}
+	q.ready.Broadcast()
+	return nil
+}
+
+func groupMessagesByChat(batch []models.WebhookRequest) [][]models.WebhookRequest {
+	groups := make([][]models.WebhookRequest, 0)
+	byChat := make(map[int64]int)
+	for _, message := range batch {
+		index, ok := byChat[message.ChatID]
+		if !ok {
+			index = len(groups)
+			byChat[message.ChatID] = index
+			groups = append(groups, nil)
+		}
+		groups[index] = append(groups[index], message)
+	}
+	return groups
 }
 
 func (q *QueueService) worker() {
-	defer q.wg.Done()
-	for msg := range q.messages {
-		q.processMessage(msg)
+	for {
+		group := q.nextGroup()
+		if len(group) == 0 || !q.sendJob(group[0]) {
+			return
+		}
+		// Release the completed page and let other groups take a turn before
+		// sending the next page. Only one worker owns a group at a time.
+		group[0] = models.WebhookRequest{}
+		q.mu.Lock()
+		q.pending--
+		if len(group) > 1 {
+			q.groups.PushBack(group[1:])
+			q.ready.Signal()
+		} else if q.closed && q.pending == 0 {
+			q.ready.Broadcast()
+		}
+		q.mu.Unlock()
 	}
 }
 
-func (q *QueueService) processMessage(msg *models.QueuedMessage) {
-	if msg.RetryCount >= models.MaxRetries {
-		msg.Status = models.StatusFailed
-		q.mu.Lock()
-		q.stats.failed++
-		q.mu.Unlock()
-		log.Printf("Message failed after %d retries: %v", models.MaxRetries, msg.Error)
-		return
-	}
-
-	// Wait for rate limiter
-	<-q.rateLimiter
-
-	msg.Status = models.StatusRetrying
-	err := q.telegram.SendMessage(&msg.WebhookRequest)
-	if err != nil {
-		msg.Error = err.Error()
-		msg.RetryCount++
-		time.Sleep(models.RetryDelay)
-		q.messages <- msg
-		return
-	}
-
-	msg.Status = models.StatusSent
+func (q *QueueService) nextGroup() []models.WebhookRequest {
 	q.mu.Lock()
-	q.stats.processed++
-	q.mu.Unlock()
-	log.Printf("Message successfully sent to chat %d", msg.ChatID)
+	defer q.mu.Unlock()
+	for q.ctx.Err() == nil {
+		if head := q.groups.Front(); head != nil {
+			return q.groups.Remove(head).([]models.WebhookRequest)
+		}
+		if q.closed && q.pending == 0 {
+			return nil
+		}
+		q.ready.Wait()
+	}
+	return nil
 }
 
-func (q *QueueService) EnqueueMessage(req *models.WebhookRequest) error {
-	// Validate message size
-	if len(req.Message) > models.MaxMessageSize {
-		return fmt.Errorf("message exceeds maximum size of %d bytes", models.MaxMessageSize)
+func (q *QueueService) sendJob(job models.WebhookRequest) bool {
+	if strings.TrimSpace(job.Message) != "" {
+		text := job
+		text.MediaType, text.MediaURL = "", ""
+		if !q.deliver(text, "text") {
+			return false
+		}
 	}
-
-	queued := &models.QueuedMessage{
-		WebhookRequest: *req,
-		Status:         models.StatusPending,
-		RetryCount:     0,
-		LastAttempt:    time.Now(),
+	if job.MediaURL != "" {
+		job.Message = ""
+		return q.deliver(job, job.MediaType)
 	}
+	return true
+}
 
-	select {
-	case q.messages <- queued:
+// deliver is complete when the operation succeeded or reached terminal failure.
+// A false result means shutdown interrupted the operation.
+func (q *QueueService) deliver(job models.WebhookRequest, kind string) bool {
+	for attempt := 1; ; attempt++ {
+		if !q.waitTurn() {
+			return false
+		}
+		err := q.send(q.ctx, job)
+		if err == nil {
+			slog.Debug("Telegram delivery succeeded", "kind", kind)
+			return true
+		}
+		if q.ctx.Err() != nil {
+			return false
+		}
+		var failure *deliveryError
+		known := errors.As(err, &failure)
+		wait := q.delay
+		if known && failure.status == 429 {
+			wait = max(wait, failure.retryAfter)
+			until := time.Now().Add(wait)
+			q.mu.Lock()
+			if until.After(q.cooldownUntil) {
+				q.cooldownUntil = until
+			}
+			q.mu.Unlock()
+		}
+		if !known || !failure.retryable || attempt == maxAttempts {
+			slog.Error("Telegram delivery failed", "kind", kind, "attempts", attempt, "error", err)
+			return true
+		}
+
+		slog.Warn("Retrying Telegram delivery", "kind", kind, "attempt", attempt, "delay", wait, "error", err)
+		if !q.wait(wait) {
+			return false
+		}
+	}
+}
+
+func (q *QueueService) waitTurn() bool {
+	for {
+		select {
+		case <-q.ctx.Done():
+			return false
+		case <-q.ticks:
+		}
 		q.mu.Lock()
-		q.stats.queued++
+		wait := time.Until(q.cooldownUntil)
 		q.mu.Unlock()
-		return nil
-	default:
-		return fmt.Errorf("message queue is full, please try again later")
+		if wait <= 0 {
+			return q.ctx.Err() == nil
+		}
+		if !q.wait(wait) {
+			return false
+		}
 	}
 }
 
-func (q *QueueService) Shutdown() {
-	close(q.messages)
-	q.wg.Wait()
+func (q *QueueService) wait(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-q.ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// Shutdown stops admission, drains until ctx expires, and returns the number
+// of jobs that did not reach a terminal result, including interrupted sends.
+func (q *QueueService) Shutdown(ctx context.Context) int64 {
+	q.mu.Lock()
+	q.closed = true
+	q.ready.Broadcast()
+	q.mu.Unlock()
+	select {
+	case <-q.done:
+	case <-ctx.Done():
+		q.cancel()
+		q.mu.Lock()
+		q.ready.Broadcast()
+		q.mu.Unlock()
+		<-q.done // All outbound requests and retry waits respect q.ctx.
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.pending
 }

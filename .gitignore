@@ -17,6 +17,8 @@ vendor/
 
 # Environment files
 .env
+.env.*
+!.env.example
 
 # IDE specific files
 .idea/

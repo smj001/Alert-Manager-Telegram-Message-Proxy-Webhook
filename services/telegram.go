@@ -1,52 +1,116 @@
 package services
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/smj/Alert-Manager-Telegram-Message-Proxy-Webhook/models"
 )
 
+const maxTelegramReply = 64 << 10
+
 type TelegramService struct {
-	bot *tgbotapi.BotAPI
+	endpoint string
+	client   *http.Client
 }
 
-func NewTelegramService(botToken string) (*TelegramService, error) {
-	bot, err := tgbotapi.NewBotAPI(botToken)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize bot: %w", err)
+func NewTelegramService(botToken string) *TelegramService {
+	return &TelegramService{
+		endpoint: "https://api.telegram.org/bot" + botToken + "/",
+		client: &http.Client{
+			Timeout: 15 * time.Second,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
-
-	return &TelegramService{bot: bot}, nil
 }
 
-func (s *TelegramService) SendMessage(req *models.WebhookRequest) error {
-	// Send text message
-	msg := tgbotapi.NewMessage(req.ChatID, req.Message)
-	if _, err := s.bot.Send(msg); err != nil {
-		return fmt.Errorf("failed to send message: %w", err)
-	}
+// deliveryError deliberately excludes Telegram's response body and network
+// error text, which can contain message content or the token-bearing URL.
+type deliveryError struct {
+	status     int
+	retryable  bool
+	retryAfter time.Duration
+}
 
-	// If media URL is provided, send media
-	if req.MediaURL != "" {
-		switch req.MediaType {
+func (e *deliveryError) Error() string {
+	if e.status == 0 {
+		return "Telegram transport failed or timed out"
+	}
+	return fmt.Sprintf("Telegram returned an unsuccessful response (status %d)", e.status)
+}
+
+// Send issues one Telegram call. For media it passes the URL to Telegram;
+// the relay does not download the attachment itself.
+func (s *TelegramService) Send(ctx context.Context, job models.WebhookRequest) error {
+	method := "sendMessage"
+	payload := map[string]any{"chat_id": job.ChatID}
+	if job.MediaURL == "" {
+		payload["text"] = job.Message
+		if job.SuppressLinkPreview {
+			payload["link_preview_options"] = map[string]bool{"is_disabled": true}
+		}
+	} else {
+		switch job.MediaType {
 		case "photo":
-			photo := tgbotapi.NewPhoto(req.ChatID, tgbotapi.FileURL(req.MediaURL))
-			if _, err := s.bot.Send(photo); err != nil {
-				return fmt.Errorf("failed to send photo: %w", err)
-			}
+			method = "sendPhoto"
 		case "video":
-			video := tgbotapi.NewVideo(req.ChatID, tgbotapi.FileURL(req.MediaURL))
-			if _, err := s.bot.Send(video); err != nil {
-				return fmt.Errorf("failed to send video: %w", err)
-			}
+			method = "sendVideo"
 		case "document":
-			doc := tgbotapi.NewDocument(req.ChatID, tgbotapi.FileURL(req.MediaURL))
-			if _, err := s.bot.Send(doc); err != nil {
-				return fmt.Errorf("failed to send document: %w", err)
-			}
+			method = "sendDocument"
+		default:
+			return errors.New("unsupported Telegram media type")
+		}
+		payload[job.MediaType] = job.MediaURL
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode Telegram request: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint+method, bytes.NewReader(body))
+	if err != nil {
+		return errors.New("could not construct Telegram request")
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := s.client.Do(request)
+	if err != nil {
+		return &deliveryError{retryable: true}
+	}
+	defer func() { _ = response.Body.Close() }()
+	return checkTelegramResponse(response)
+}
+
+func checkTelegramResponse(response *http.Response) error {
+	var reply struct {
+		OK         bool `json:"ok"`
+		ErrorCode  int  `json:"error_code"`
+		Parameters struct {
+			RetryAfter int64 `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxTelegramReply+1))
+	parsed := err == nil && len(data) <= maxTelegramReply && json.Unmarshal(data, &reply) == nil
+	status := response.StatusCode
+	if status >= 200 && status < 300 {
+		if parsed && reply.OK {
+			return nil
+		}
+		if parsed && reply.ErrorCode >= 400 && reply.ErrorCode < 600 {
+			status = reply.ErrorCode
+		} else {
+			return &deliveryError{status: status, retryable: true}
 		}
 	}
-
-	return nil
+	var wait time.Duration
+	if seconds := reply.Parameters.RetryAfter; parsed && status == http.StatusTooManyRequests && seconds > 0 && seconds <= (1<<63-1)/int64(time.Second) {
+		wait = time.Duration(seconds) * time.Second
+	}
+	return &deliveryError{status: status, retryable: status == http.StatusTooManyRequests || status >= 500, retryAfter: wait}
 }

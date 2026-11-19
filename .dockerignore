@@ -1,0 +1,7 @@
+**/.env*
+.git
+bin/
+*.out
+*.test
+.idea/
+.vscode/
