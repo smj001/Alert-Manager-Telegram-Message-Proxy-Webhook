@@ -54,7 +54,7 @@ func (h *AlertManagerHandler) HandleAlertManagerWebhook(w http.ResponseWriter, r
 	batch := make([]models.WebhookRequest, 0, len(destinations))
 	for _, chatID := range destinations {
 		for _, page := range digestPages(byChat[chatID]) {
-			batch = append(batch, models.WebhookRequest{ChatID: chatID, Message: page, SuppressLinkPreview: true})
+			batch = append(batch, models.WebhookRequest{ChatID: chatID, Message: page.text, Entities: page.entities, SuppressLinkPreview: true})
 		}
 	}
 	acceptBatch(w, h.queue, batch)

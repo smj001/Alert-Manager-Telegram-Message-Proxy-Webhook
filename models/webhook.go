@@ -19,8 +19,17 @@ type WebhookRequest struct {
 	Message   string `json:"message"`
 	MediaURL  string `json:"media_url,omitempty"`
 	MediaType string `json:"media_type,omitempty"`
-	// Internal rendering preference; not part of the public webhook payload.
-	SuppressLinkPreview bool `json:"-"`
+	// Internal rendering fields; not part of the public webhook payload.
+	SuppressLinkPreview bool            `json:"-"`
+	Entities            []MessageEntity `json:"-"`
+}
+
+// MessageEntity identifies a span in Telegram message text using UTF-16 units.
+type MessageEntity struct {
+	Type   string `json:"type"`
+	Offset int    `json:"offset"`
+	Length int    `json:"length"`
+	URL    string `json:"url"`
 }
 
 func (r WebhookRequest) Validate() error {

@@ -2,8 +2,11 @@ package handlers
 
 import (
 	"fmt"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/smj/Alert-Manager-Telegram-Message-Proxy-Webhook/models"
@@ -12,31 +15,48 @@ import (
 const (
 	alertsPerPage = 10
 	cardSeparator = "\n\n"
+	sourceLabel   = "Open in Prometheus"
+	sourcePrefix  = "\n\n🔗 "
+	maxSourceURL  = 4096
 )
 
-func digestPages(alerts []models.AlertManagerAlert) []string {
-	const title = "📟 Alertmanager"
-	if len(alerts) == 1 {
-		return []string{title + cardSeparator + renderAlert(0, alerts[0])}
-	}
-	firing := 0
-	for _, alert := range alerts {
-		if alert.Status == "firing" {
-			firing++
+type digestPage struct {
+	text     string
+	entities []models.MessageEntity
+}
+
+func digestPages(alerts []models.AlertManagerAlert) []digestPage {
+	header := "📟 Alertmanager"
+	if len(alerts) > 1 {
+		firing := 0
+		for _, alert := range alerts {
+			if alert.Status == "firing" {
+				firing++
+			}
 		}
+		header += fmt.Sprintf("\n%d alerts · 🔴 %d firing · ✅ %d resolved", len(alerts), firing, len(alerts)-firing)
 	}
-	header := fmt.Sprintf("%s\n%d alerts · 🔴 %d firing · ✅ %d resolved", title, len(alerts), firing, len(alerts)-firing)
 	// Worst-case page-number width is the alert count: one card per page.
 	reserved := telegramTextLength(fmt.Sprintf("%s\nPage %d/%d%s", header, len(alerts), len(alerts), cardSeparator))
-	var pages []string
+	var pages []digestPage
 	var page strings.Builder
+	var entities []models.MessageEntity
 	size, cards := 0, 0
 	for i, alert := range alerts {
-		card := renderAlert(i+1, alert)
+		number := i + 1
+		if len(alerts) == 1 {
+			number = 0
+		}
+		card := renderAlert(number, alert)
 		length := telegramTextLength(card)
+		source := alertSource(alert.GeneratorURL)
+		if source != "" {
+			length += telegramTextLength(sourcePrefix) + len(sourceLabel)
+		}
 		if cards != 0 && (cards == alertsPerPage || reserved+size+len(cardSeparator)+length > models.MaxMessageSize) {
-			pages = append(pages, page.String())
+			pages = append(pages, digestPage{text: page.String(), entities: entities})
 			page.Reset()
+			entities = nil
 			size, cards = 0, 0
 		}
 		if cards != 0 {
@@ -44,18 +64,56 @@ func digestPages(alerts []models.AlertManagerAlert) []string {
 			size += len(cardSeparator)
 		}
 		page.WriteString(card)
+		if source != "" {
+			page.WriteString(sourcePrefix)
+			page.WriteString(sourceLabel)
+			entities = append(entities, models.MessageEntity{
+				Type: "text_link", Offset: size + length - len(sourceLabel), Length: len(sourceLabel), URL: source,
+			})
+		}
 		size += length
 		cards++
 	}
-	pages = append(pages, page.String())
-	for i, text := range pages {
+	if cards != 0 {
+		pages = append(pages, digestPage{text: page.String(), entities: entities})
+	}
+	for i := range pages {
+		prefix := header
 		if len(pages) > 1 {
-			pages[i] = fmt.Sprintf("%s\nPage %d/%d%s%s", header, i+1, len(pages), cardSeparator, text)
-		} else {
-			pages[i] = header + cardSeparator + text
+			prefix += fmt.Sprintf("\nPage %d/%d", i+1, len(pages))
+		}
+		prefix += cardSeparator
+		pages[i].text = prefix + pages[i].text
+		headerLength := telegramTextLength(prefix)
+		for j := range pages[i].entities {
+			pages[i].entities[j].Offset += headerLength
 		}
 	}
 	return pages
+}
+
+func alertSource(raw string) string {
+	if raw == "" || len(raw) > maxSourceURL || strings.ContainsAny(raw, "\\<>\"") || strings.IndexFunc(raw, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil {
+		return ""
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return ""
+	}
+	if port := u.Port(); port != "" {
+		if n, err := strconv.ParseUint(port, 10, 16); err != nil || n == 0 {
+			return ""
+		}
+	}
+	if _, err := url.QueryUnescape(u.RawQuery); err != nil {
+		return ""
+	}
+	return raw
 }
 
 func renderAlert(number int, alert models.AlertManagerAlert) string {

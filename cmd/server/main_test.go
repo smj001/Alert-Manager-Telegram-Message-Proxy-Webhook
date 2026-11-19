@@ -33,8 +33,8 @@ func TestServeRoutesAndDrain(t *testing.T) {
 		status             int
 	}{
 		{"GET", "/health", "", 200},
-		{"POST", "/webhook", `{"chat_id":1,"message":"hello"}`, 202},
-		{"POST", "/alertmanager/webhook", `{"alerts":[{"status":"resolved","labels":{"chat_id":"-2","alertname":"Demo"}}]}`, 202},
+		{"POST", "/webhook", `{"chat_id":1,"message":"hello","entities":[{"type":"text_link","offset":0,"length":5,"url":"https://other.example/"}]}`, 202},
+		{"POST", "/alertmanager/webhook", `{"alerts":[{"status":"resolved","labels":{"chat_id":"-2","alertname":"Demo"},"generatorURL":"https://prom.example/graph"}]}`, 202},
 	} {
 		req, err := http.NewRequest(tt.method, "http://"+listener.Addr().String()+tt.path, strings.NewReader(tt.body))
 		if err != nil {
@@ -62,11 +62,14 @@ func TestServeRoutesAndDrain(t *testing.T) {
 		t.Fatal("server did not stop")
 	}
 	close(deliveries)
-	received := map[int64]string{}
+	received := map[int64]models.WebhookRequest{}
 	for job := range deliveries {
-		received[job.ChatID] = job.Message
+		received[job.ChatID] = job
 	}
-	if len(received) != 2 || received[1] != "hello" || !strings.Contains(received[-2], "RESOLVED") {
+	if len(received) != 2 || received[1].Message != "hello" || len(received[1].Entities) != 0 || !strings.Contains(received[-2].Message, "RESOLVED") {
 		t.Fatalf("unexpected deliveries: %v", received)
+	}
+	if got := received[-2].Entities; len(got) != 1 || got[0].URL != "https://prom.example/graph" {
+		t.Fatalf("alert source was not preserved through the queue: %v", got)
 	}
 }

@@ -54,6 +54,9 @@ func (s *TelegramService) Send(ctx context.Context, job models.WebhookRequest) e
 	payload := map[string]any{"chat_id": job.ChatID}
 	if job.MediaURL == "" {
 		payload["text"] = job.Message
+		if len(job.Entities) > 0 {
+			payload["entities"] = job.Entities
+		}
 		if job.SuppressLinkPreview {
 			payload["link_preview_options"] = map[string]bool{"is_disabled": true}
 		}

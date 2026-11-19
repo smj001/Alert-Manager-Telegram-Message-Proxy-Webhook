@@ -27,6 +27,11 @@ func TestTelegramOperations(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			job := models.WebhookRequest{ChatID: -123, Message: "hello", MediaType: tt.mediaType, SuppressLinkPreview: tt.suppressLinkPreview}
+			const source = "https://prom.example/graph?q=up%3D0&tab=1"
+			if tt.suppressLinkPreview {
+				job.Message = "🔗 Open in Prometheus"
+				job.Entities = []models.MessageEntity{{Type: "text_link", Offset: 3, Length: 18, URL: source}}
+			}
 			value := job.Message
 			if tt.mediaType != "" {
 				job.Message, job.MediaURL = "", "https://example.com/file"
@@ -46,6 +51,16 @@ func TestTelegramOperations(t *testing.T) {
 				}
 				if _, ok := body["parse_mode"]; ok {
 					t.Error("alert text must not be interpreted as markup")
+				}
+				if entities, present := body["entities"]; tt.suppressLinkPreview {
+					spans, ok := entities.([]any)
+					if !ok || len(spans) != 1 {
+						t.Errorf("expected one Telegram entity, got %v", entities)
+					} else if link, ok := spans[0].(map[string]any); !ok || link["type"] != "text_link" || link["offset"] != float64(3) || link["length"] != float64(18) || link["url"] != source {
+						t.Errorf("unexpected Telegram link entity: %v", spans[0])
+					}
+				} else if present {
+					t.Errorf("unexpected entities on non-alert message: %v", entities)
 				}
 				_, _ = fmt.Fprint(w, `{"ok":true}`)
 			}))

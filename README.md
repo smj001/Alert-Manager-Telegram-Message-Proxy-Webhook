@@ -17,6 +17,7 @@ GET /health ──────────────────────�
 | ALERT-1 | Route each firing/resolved alert using its own `chat_id` or the common label. Admit the whole batch or none. |
 | ALERT-2 | Render a readable digest per destination chat. Preserve alert order and status within that request, number pages when needed, and keep each page within the Telegram text limit. Never mix chats. |
 | ALERT-2A | Single alerts omit the digest counts and entry number. Show summary and multiline details as plain text, omit duplicate summary/details and the raw Prometheus `generatorURL`; batching, routing, and `/webhook` are unchanged. |
+| ALERT-2B | Show a clickable `Open in Prometheus` label for each valid alert source, without displaying the raw URL or adding link previews. Keep the original query and correct link-to-alert mapping after pagination. Skip missing or invalid sources without rejecting the alert. |
 | ALERT-3 | Send a chat's pages sequentially within a request. Retry only the current page. Count all pending pages toward queue capacity and reject the entire request if they do not fit. |
 | SEND-1 | Send text and optional URL media. Retry temporary failures with timeouts and rate limits. A media retry does not replay successful text. Never log tokens, message text, or media URLs. |
 | OPS-1 | Validate configuration at startup, expose process liveness, and stop taking HTTP traffic before draining the queue on termination. |
@@ -96,9 +97,13 @@ CPU usage crossed 90%.
 Details
 1. Check the top CPU consumers.
 2. Compare usage with the last deployment.
+
+🔗 Open in Prometheus
 ```
 
-Single alerts omit counts and numbering. Multi-alert digests show firing and resolved counts and up to 10 alerts per message, paginated as `Page 1/N`, `Page 2/N`, etc. Each chat only sees its own alerts. The 4,096-character message budget is conservative for emoji; long display fields are shortened with `…`. The raw Prometheus `generatorURL` is omitted; intentional runbook links in annotations are kept. Text is not interpreted as HTML or Markdown, and Telegram link previews are disabled for digests.
+Single alerts omit counts and numbering. Multi-alert digests show firing and resolved counts and up to 10 alerts per message, paginated as `Page 1/N`, `Page 2/N`, etc. Each chat only sees its own alerts. The 4,096-character message budget is conservative for emoji; long display fields are shortened with `…`. Each alert with a valid `generatorURL` gets a tappable **Open in Prometheus** label that opens the original query without printing the URL. Missing, invalid, or overly long URLs are skipped. Runbook links in annotations are kept, text is not interpreted as HTML or Markdown, and Telegram link previews are disabled.
+
+If the link opens a cluster-only hostname, set Prometheus [`--web.external-url`](https://prometheus.io/docs/prometheus/latest/command-line/prometheus/) to the address that responders can reach (for example, the existing authenticated Prometheus ingress). The relay preserves the sender's URL; it does not rewrite it or expose Prometheus.
 
 ```yaml
 route:
@@ -150,6 +155,8 @@ The tests exercise request admission and Alertmanager routing, worker shutdown a
 **VM deployment (2026-11-19):** Installed Ubuntu's Docker Engine and Compose packages. Loaded a checksum-verified Linux amd64 image. The initial loopback deployment passed webhook authentication and validation checks, and Telegram `getMe` succeeded from the running container. Docker Compose then published port `8080` on the public interface; external HTTP checks returned `200` for health and `401` for the unauthenticated Alertmanager route. No Telegram test message was sent and HTTPS is not configured.
 
 **Alert layout (ALERT-2A):** The new formatting passed `go test -race ./...`, `go vet ./...`, `golangci-lint run ./...`, the formatter check, and a local Docker image build that runs `go test ./...`. Regression tests cover source URL omission, retained annotation links and spacing-sensitive runbook text, deduplication, and 500-alert pagination. Use those tests for the formatting check and verify health and webhook authentication after each rollout.
+
+**Prometheus source links (ALERT-2B):** Race tests, `go vet ./...`, `golangci-lint run ./...`, the formatter check, and the local Docker build passed. Tests verify UTF-16 link spans across pages, Telegram API payloads, and omission of invalid source links. No live Telegram message was sent and this change was not deployed.
 
 ## License
 

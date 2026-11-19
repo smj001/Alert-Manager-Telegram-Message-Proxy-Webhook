@@ -135,12 +135,12 @@ func TestAlertDigestIsolatedByChat(t *testing.T) {
 	if first.ChatID != 1 || second.ChatID != 2 || strings.Contains(first.Message, "SecretOtherChat") || strings.Contains(second.Message, "CPUHigh") {
 		t.Fatalf("chat isolation failure: %+v", q.jobs)
 	}
-	for _, part := range []string{"2 alerts", "1 firing", "1 resolved", "1. 🔴 FIRING · CPUHigh", "2. ✅ RESOLVED · MemoryHigh", "CRITICAL", "worker-1", "<load>", "CPU usage crossed 90%.", "08:27 UTC", "09:30 UTC"} {
+	for _, part := range []string{"2 alerts", "1 firing", "1 resolved", "1. 🔴 FIRING · CPUHigh", "2. ✅ RESOLVED · MemoryHigh", "CRITICAL", "worker-1", "<load>", "CPU usage crossed 90%.", "08:27 UTC", "09:30 UTC", "Open in Prometheus"} {
 		if !strings.Contains(first.Message, part) {
 			t.Errorf("digest missing %q:\n%s", part, first.Message)
 		}
 	}
-	if strings.Contains(first.Message, "prom.example") || strings.Contains(first.Message, "javascript:") || strings.Contains(first.Message, "Page 1/1") {
+	if strings.Contains(first.Message, "prom.example") || strings.Contains(first.Message, "javascript:") || strings.Contains(first.Message, "Page 1/1") || strings.Count(first.Message, "Open in Prometheus") != 1 || strings.Contains(second.Message, "Open in Prometheus") {
 		t.Fatalf("unwanted content in digest:\n%s", first.Message)
 	}
 }
@@ -152,12 +152,12 @@ func TestAlertDigestSingleAlertLayout(t *testing.T) {
 		{
 			"firing with multiline runbook",
 			`{"status":"firing","labels":{"alertname":"BackupStale","severity":"critical","instance":"gitlab.example"},"startsAt":"2026-11-19T03:31:00Z","annotations":{"summary":"No verified backup for >26h","description":"1. Check /var/log/backup.log\r\n   grep 'disk  full' /var/log/backup.log\r\n2. Confirm at least 40 GB free.\r\n\r\n\r\nIf needed, check https://docs.example/backup."},"generatorURL":"http://prometheus.monitoring:9090/graph?g0.expr=backup_query"}`,
-			"📟 Alertmanager\n\n🔴 FIRING · BackupStale\nSeverity: CRITICAL · Instance: gitlab.example\nSince: 2026-11-19 03:31 UTC\n\nNo verified backup for >26h\n\nDetails\n1. Check /var/log/backup.log\n   grep 'disk  full' /var/log/backup.log\n2. Confirm at least 40 GB free.\n\nIf needed, check https://docs.example/backup.",
+			"📟 Alertmanager\n\n🔴 FIRING · BackupStale\nSeverity: CRITICAL · Instance: gitlab.example\nSince: 2026-11-19 03:31 UTC\n\nNo verified backup for >26h\n\nDetails\n1. Check /var/log/backup.log\n   grep 'disk  full' /var/log/backup.log\n2. Confirm at least 40 GB free.\n\nIf needed, check https://docs.example/backup.\n\n🔗 Open in Prometheus",
 		},
 		{
 			"resolved without duplicate details",
 			`{"status":"resolved","labels":{"alertname":"BackupStale"},"endsAt":"2026-11-19T05:31:00+02:00","annotations":{"summary":"Backup verified","description":" Backup\nverified "},"generatorURL":"https://prom.example/graph"}`,
-			"📟 Alertmanager\n\n✅ RESOLVED · BackupStale\nCleared: 2026-11-19 03:31 UTC\n\nBackup verified",
+			"📟 Alertmanager\n\n✅ RESOLVED · BackupStale\nCleared: 2026-11-19 03:31 UTC\n\nBackup verified\n\n🔗 Open in Prometheus",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -174,12 +174,104 @@ func TestAlertDigestSingleAlertLayout(t *testing.T) {
 	}
 }
 
+func TestAlertDigestSourceLabelsAfterPagination(t *testing.T) {
+	payload := models.AlertManagerWebhook{CommonLabels: map[string]string{"chat_id": "1"}}
+	const source = "https://prom.example/graph?g0.expr=up%7Bjob%3D%22node%22%7D+%3D%3D+0&g0.tab=1#"
+	for i := 1; i <= 11; i++ {
+		payload.Alerts = append(payload.Alerts, models.AlertManagerAlert{
+			Status:       "firing",
+			Labels:       map[string]string{"alertname": fmt.Sprintf("Probe%02d", i)},
+			Annotations:  map[string]string{"summary": "🚨 Network probe failed"},
+			GeneratorURL: fmt.Sprintf("%s%d", source, i),
+		})
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := &recorder{}
+	w := webhookRequest(NewAlertManagerHandler(q, "test").HandleAlertManagerWebhook, "POST", "Bearer test", string(body))
+	if w.Code != 202 || len(q.jobs) != 2 {
+		t.Fatalf("status=%d pages=%d, want 2", w.Code, len(q.jobs))
+	}
+	alert := 1
+	for i, job := range q.jobs {
+		if got, want := len(job.Entities), []int{10, 1}[i]; got != want {
+			t.Fatalf("page %d: got %d links, want %d", i+1, got, want)
+		}
+		units := utf16.Encode([]rune(job.Message))
+		previous := 0
+		for _, link := range job.Entities {
+			if link.Offset < previous || link.Length <= 0 || link.Offset+link.Length > len(units) {
+				t.Fatalf("invalid span: %+v", link)
+			}
+			if label := string(utf16.Decode(units[link.Offset : link.Offset+link.Length])); label != "Open in Prometheus" || link.Type != "text_link" || link.URL != fmt.Sprintf("%s%d", source, alert) {
+				t.Fatalf("alert %d: bad source label %q or target %+v", alert, label, link)
+			}
+			if preceding := string(utf16.Decode(units[previous:link.Offset])); !strings.Contains(preceding, fmt.Sprintf("Probe%02d", alert)) {
+				t.Fatalf("source link is not attached to alert %d", alert)
+			}
+			previous = link.Offset + link.Length
+			alert++
+		}
+		if strings.Contains(job.Message, "prom.example") || !job.SuppressLinkPreview {
+			t.Fatal("raw source or link preview was not suppressed")
+		}
+	}
+}
+
+func TestAlertDigestSkipsInvalidSources(t *testing.T) {
+	for _, source := range []string{
+		"", "/graph", "javascript:alert(1)", "https:///graph", "https://user:pass@prom.example/graph",
+		"https://prom.example/graph?q=a b", "https://prom.example/graph?q=%zz", "https://prom.example\\fake/graph",
+		"https://prom.example:65536/graph", "https://prom.example:0/graph", "https://prom.example:/graph",
+		"https://prom.example/graph?q=" + strings.Repeat("x", 4096),
+	} {
+		const valid = "https://prom.example:9090/graph"
+		page := digestPages([]models.AlertManagerAlert{
+			{Status: "firing", GeneratorURL: valid}, {Status: "resolved", GeneratorURL: source},
+		})[0]
+		if !strings.Contains(page.text, "RESOLVED") || strings.Count(page.text, "Open in Prometheus") != 1 || len(page.entities) != 1 || page.entities[0].URL != valid {
+			t.Errorf("invalid source should be skipped without dropping the alert (URL length %d)", len(source))
+		}
+	}
+}
+
+func TestAlertDigestCountsSourceLabelInPageBudget(t *testing.T) {
+	alert := models.AlertManagerAlert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": strings.Repeat("x", 155), "instance": strings.Repeat("i", 150), "severity": strings.Repeat("s", 40)},
+		Annotations: map[string]string{"summary": strings.Repeat("s", 390), "description": strings.Repeat("🚨", 610)},
+	}
+	alerts := []models.AlertManagerAlert{alert, alert}
+	if pages := digestPages(alerts); len(pages) != 1 {
+		t.Fatalf("without links the cards should fit on one page, got %d", len(pages))
+	}
+	for i := range alerts {
+		alerts[i].GeneratorURL = "https://prom.example/graph"
+	}
+	pages := digestPages(alerts)
+	if len(pages) != 2 {
+		t.Fatalf("source labels should push the second card to a new page, got %d pages", len(pages))
+	}
+	for _, page := range pages {
+		units := utf16.Encode([]rune(page.text))
+		if len(units) > models.MaxMessageSize || len(page.entities) != 1 {
+			t.Fatalf("oversized page or missing entity: length=%d, entities=%v", len(units), page.entities)
+		}
+		span := page.entities[0]
+		if end := span.Offset + span.Length; span.Offset < 0 || end > len(units) || string(utf16.Decode(units[span.Offset:end])) != "Open in Prometheus" {
+			t.Fatalf("invalid link span: %+v", span)
+		}
+	}
+}
+
 func TestAlertDigestKeepsLongDuplicateTextOnce(t *testing.T) {
 	text := strings.Repeat("backups ", 60) + "verify checksum"
 	page := digestPages([]models.AlertManagerAlert{{
 		Status:      "firing",
 		Annotations: map[string]string{"summary": text, "description": text},
-	}})[0]
+	}})[0].text
 	if strings.Count(page, text) != 1 {
 		t.Fatalf("shared summary and description should appear in full once:\n%s", page)
 	}
